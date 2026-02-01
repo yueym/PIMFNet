@@ -1,0 +1,1131 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import xarray as xr
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
+import os
+import time
+import gc
+from torch.cuda.amp import autocast, GradScaler
+from scipy import stats
+import math
+import torch.nn.functional as F
+
+
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+# ==================== MultiTaskHead ====================
+class MultiTaskHead(nn.Module):
+    def __init__(self, input_dim=128, dropout_rate=0.1):
+        super(MultiTaskHead, self).__init__()
+        print(f"[INFO] MultiTaskHead initialized with input_dim={input_dim} (TCN)")
+
+        self.shared = nn.Sequential(
+            nn.Conv2d(input_dim, 192, kernel_size=1),
+            nn.BatchNorm2d(192),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Conv2d(192, 128, kernel_size=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate)
+        )
+
+        self.point_head = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Conv2d(64, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        self.prob_mu = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Conv2d(64, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        self.prob_log_sigma = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Conv2d(64, 1, kernel_size=1)
+        )
+
+        self.interval_head = nn.Sequential(
+            nn.Conv2d(128, 64, kernel_size=1),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Conv2d(64, 4, kernel_size=1),
+            nn.Softplus()
+        )
+
+        self._initialize_weights()
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+        log_sigma_convs = [m for m in self.prob_log_sigma.modules() if isinstance(m, nn.Conv2d)]
+        if len(log_sigma_convs) > 0:
+            last_conv = log_sigma_convs[-1]
+            if last_conv.bias is not None:
+                nn.init.constant_(last_conv.bias, -2.5)
+
+    def forward(self, x):
+        shared_feat = self.shared(x)
+
+        point_pred = self.point_head(shared_feat).squeeze(1)
+        mu = self.prob_mu(shared_feat).squeeze(1)
+        log_sigma = self.prob_log_sigma(shared_feat).squeeze(1)
+        log_sigma = torch.clamp(log_sigma, min=-4.6, max=-1.2)
+        sigma = torch.exp(log_sigma)
+
+        interval_deltas = self.interval_head(shared_feat)
+        interval_cumsum = torch.cumsum(interval_deltas, dim=1)
+        interval_max = interval_cumsum[:, -1:, :, :] + 1e-6
+        interval_sorted = interval_cumsum / interval_max
+        interval_sorted = torch.clamp(interval_sorted, min=0.0, max=1.0)
+
+        return point_pred, mu, sigma, interval_sorted
+
+
+# ==================== TCN核心组件 ====================
+class Chomp1d(nn.Module):
+    """裁剪模块：移除因果卷积产生的多余padding"""
+
+    def __init__(self, chomp_size):
+        super(Chomp1d, self).__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        if self.chomp_size > 0:
+            return x[:, :, :-self.chomp_size].contiguous()
+        return x
+
+
+class TemporalBlock(nn.Module):
+    """TCN基本块"""
+
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.1):
+        super(TemporalBlock, self).__init__()
+
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size, stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.bn1 = nn.BatchNorm1d(n_outputs)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size, stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.bn2 = nn.BatchNorm1d(n_outputs)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1, self.chomp1, self.bn1, self.relu1, self.dropout1,
+            self.conv2, self.chomp2, self.bn2, self.relu2, self.dropout2
+        )
+
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU(inplace=True)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.conv1.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.conv2.weight, mode='fan_out', nonlinearity='relu')
+        if self.downsample is not None:
+            nn.init.kaiming_normal_(self.downsample.weight, mode='fan_out', nonlinearity='relu')
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class TemporalConvNet(nn.Module):
+    """TCN主干网络"""
+
+    def __init__(self, num_inputs, num_channels, kernel_size=3, dropout=0.1):
+        super(TemporalConvNet, self).__init__()
+        layers = []
+        num_levels = len(num_channels)
+
+        for i in range(num_levels):
+            dilation_size = 2 ** i
+            in_channels = num_inputs if i == 0 else num_channels[i - 1]
+            out_channels = num_channels[i]
+            padding = (kernel_size - 1) * dilation_size
+
+            layers.append(TemporalBlock(
+                in_channels, out_channels, kernel_size,
+                stride=1, dilation=dilation_size,
+                padding=padding, dropout=dropout
+            ))
+
+        self.network = nn.Sequential(*layers)
+
+        receptive_field = 1
+        for i in range(num_levels):
+            dilation = 2 ** i
+            receptive_field += 2 * (kernel_size - 1) * dilation
+        print(f"[INFO] TCN Receptive Field: {receptive_field}")
+
+    def forward(self, x):
+        return self.network(x)
+
+
+# ==================== TCN风速预测模型 ====================
+class TCNWindSpeedPredictor(nn.Module):
+    """
+    TCN风速预测模型 - 多任务版本
+    架构保持不变，只调整超参数
+    """
+
+    def __init__(self, H, W, tigge_features=10, dropout_rate=0.1,
+                 tcn_channels=[32, 64, 96], kernel_size=3, output_dim=128):
+        super(TCNWindSpeedPredictor, self).__init__()
+        print("[INFO] TCNWindSpeedPredictor initialized - Multi-Task Version")
+
+        self.H = H
+        self.W = W
+        self.output_dim = output_dim
+
+        input_dim = tigge_features + 5  # 15
+
+        # 输入投影层
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, tcn_channels[0]),
+            nn.LayerNorm(tcn_channels[0]),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate)
+        )
+
+        # TCN主干
+        self.tcn = TemporalConvNet(
+            num_inputs=tcn_channels[0],
+            num_channels=tcn_channels,
+            kernel_size=kernel_size,
+            dropout=dropout_rate
+        )
+
+        # 时序注意力池化
+        self.temporal_attention = nn.Sequential(
+            nn.Linear(tcn_channels[-1], tcn_channels[-1] // 2),
+            nn.Tanh(),
+            nn.Linear(tcn_channels[-1] // 2, 1)
+        )
+
+        # 特征融合层
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(tcn_channels[-1], output_dim),
+            nn.LayerNorm(output_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate)
+        )
+
+        # 输出层
+        self.output_layer = nn.Sequential(
+            nn.Linear(output_dim, output_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_rate),
+            nn.Linear(output_dim // 2, output_dim)
+        )
+
+        # MultiTaskHead
+        self.multi_task_head = MultiTaskHead(
+            input_dim=output_dim,
+            dropout_rate=dropout_rate
+        )
+
+        self._initialize_weights()
+
+        total_params = sum(p.numel() for p in self.parameters())
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"[INFO] TCN Model Configuration:")
+        print(f"  Input dim: {input_dim}")
+        print(f"  TCN channels: {tcn_channels}")
+        print(f"  Kernel size: {kernel_size}")
+        print(f"  Output dim: {output_dim}")
+        print(f"[INFO] Total parameters: {total_params:,}")
+        print(f"[INFO] Trainable parameters: {trainable_params:,}")
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, tigge_spatial, dem_spatial, interaction_spatial,
+                tigge_seq, time_features_t, time_features_seq):
+        B, seq_len, C, H, W = tigge_seq.shape
+
+        # 重塑为 (B*H*W, seq_len, C)
+        tigge_seq_reshaped = tigge_seq.permute(0, 3, 4, 1, 2).reshape(B * H * W, seq_len, C)
+
+        # 扩展时间特征
+        time_seq_expanded = time_features_seq.unsqueeze(1).unsqueeze(2).expand(B, H, W, seq_len, 5)
+        time_seq_expanded = time_seq_expanded.reshape(B * H * W, seq_len, 5)
+
+        # 拼接特征
+        tcn_input = torch.cat([tigge_seq_reshaped, time_seq_expanded], dim=-1)
+
+        # 清理中间变量
+        del tigge_seq_reshaped, time_seq_expanded
+
+        # 输入投影
+        x = self.input_projection(tcn_input)
+        del tcn_input
+
+        # TCN处理 (需要 channels-first)
+        x = x.permute(0, 2, 1)  # (B*H*W, channels, seq_len)
+        x = self.tcn(x)
+        x = x.permute(0, 2, 1)  # (B*H*W, seq_len, channels)
+
+        # 注意力池化
+        attn_weights = self.temporal_attention(x)
+        attn_weights = F.softmax(attn_weights, dim=1)
+        x = torch.sum(x * attn_weights, dim=1)  # (B*H*W, channels)
+
+        # 特征融合
+        x = self.feature_fusion(x)
+
+        # 输出层
+        x = torch.clamp(x, -50, 50)
+        out = self.output_layer(x)
+
+        # 重塑为空间格式
+        out = out.reshape(B, H, W, -1).permute(0, 3, 1, 2)
+
+        # MultiTaskHead
+        point_pred, mu, sigma, interval_pred = self.multi_task_head(out)
+
+        return point_pred, mu, sigma, interval_pred
+
+
+# ==================== WindDataset ====================
+class WindDataset(Dataset):
+    def __init__(self, ds_path, H=48, W=96, seq_len=4):
+        self.H = H
+        self.W = W
+        self.seq_len = seq_len
+        self.samples_per_time = H * W
+
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loading dataset from {ds_path}")
+
+        ds = xr.open_dataset(ds_path, cache=False)
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Dataset variables: {list(ds.data_vars.keys())}")
+
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Preloading data to memory...")
+
+        tigge_raw = ds['tigge_features'].values
+        dem_raw = ds['dem_features'].values
+        interaction_raw = ds['interaction_features'].values
+        target_raw = ds['target'].values
+        time_data = ds['time_features'].values
+
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Raw shapes:")
+        print(f"  tigge: {tigge_raw.shape}, dem: {dem_raw.shape}, interaction: {interaction_raw.shape}")
+        print(f"  target: {target_raw.shape}, time: {time_data.shape}")
+
+        total_samples = tigge_raw.shape[0]
+        self.T = total_samples // self.samples_per_time
+
+        self.tigge_features = tigge_raw.reshape(self.T, H, W, -1)
+        self.dem_features = dem_raw.reshape(self.T, H, W, -1)
+        self.interaction_features = interaction_raw.reshape(self.T, H, W, -1)
+        self.target = target_raw.reshape(self.T, H, W)
+
+        time_data_per_t = time_data.reshape(self.T, self.samples_per_time, -1)[:, 0, :]
+        self.time_scaler = StandardScaler()
+        self.time_features_normalized = self.time_scaler.fit_transform(time_data_per_t)
+
+        self.sample_indices = np.arange(self.T - self.seq_len + 1)
+
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Data ranges:")
+        print(f"  tigge: [{self.tigge_features.min():.4f}, {self.tigge_features.max():.4f}]")
+        print(f"  dem: [{self.dem_features.min():.4f}, {self.dem_features.max():.4f}]")
+        print(f"  target: [{self.target.min():.4f}, {self.target.max():.4f}]")
+
+        ds.close()
+        del ds, tigge_raw, dem_raw, interaction_raw, target_raw, time_data
+        gc.collect()
+
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Total time points: {self.T}")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Valid samples: {len(self.sample_indices)}")
+
+    def __len__(self):
+        return len(self.sample_indices)
+
+    def __getitem__(self, idx):
+        t_start = self.sample_indices[idx]
+        t_end = t_start + self.seq_len
+
+        tigge_seq = self.tigge_features[t_start:t_end]
+        time_features_seq = self.time_features_normalized[t_start:t_end]
+
+        t_current = t_end - 1
+        tigge_spatial = self.tigge_features[t_current]
+        dem_spatial = self.dem_features[t_current]
+        interaction_spatial = self.interaction_features[t_current]
+        target = self.target[t_current]
+        time_features_t = self.time_features_normalized[t_current]
+
+        return {
+            'tigge_spatial': torch.from_numpy(tigge_spatial).float().permute(2, 0, 1),
+            'dem_spatial': torch.from_numpy(dem_spatial).float().permute(2, 0, 1),
+            'interaction_spatial': torch.from_numpy(interaction_spatial).float().permute(2, 0, 1),
+            'tigge_seq': torch.from_numpy(tigge_seq).float().permute(0, 3, 1, 2),
+            'time_features_t': torch.from_numpy(time_features_t).float(),
+            'time_features_seq': torch.from_numpy(time_features_seq).float(),
+            'target': torch.from_numpy(target).float()
+        }
+
+
+# ==================== CRPS计算 ====================
+def compute_crps(mu, sigma, target):
+    sigma = torch.clamp(sigma, min=0.01, max=0.3)
+    z = (target - mu) / sigma
+    z = torch.clamp(z, min=-5.0, max=5.0)
+    phi_z = 0.5 * (1.0 + torch.erf(z / np.sqrt(2)))
+    log_pdf = -0.5 * z ** 2 - 0.5 * np.log(2 * np.pi)
+    pdf_z = torch.exp(log_pdf)
+    term1 = z * (2 * phi_z - 1)
+    term2 = 2 * pdf_z
+    term3 = 1.0 / np.sqrt(np.pi)
+    crps = sigma * (term1 + term2 - term3)
+    crps_mean = torch.abs(crps).mean()
+
+    if torch.isnan(crps_mean) or torch.isinf(crps_mean):
+        return torch.tensor(0.0, device=mu.device, dtype=mu.dtype)
+    if crps_mean > 1.0:
+        crps_mean = torch.clamp(crps_mean, max=0.5)
+
+    return crps_mean
+
+
+# ==================== 区间指标计算 ====================
+def compute_interval_metrics(interval_pred, target, point_pred):
+    interval_pred = interval_pred.float()
+    target = target.float()
+    point_pred = point_pred.float()
+
+    q_0025 = interval_pred[:, 0, :, :]
+    q_025 = interval_pred[:, 1, :, :]
+    q_075 = interval_pred[:, 2, :, :]
+    q_0975 = interval_pred[:, 3, :, :]
+
+    q_0025_flat = q_0025.flatten()
+    q_025_flat = q_025.flatten()
+    q_075_flat = q_075.flatten()
+    q_0975_flat = q_0975.flatten()
+    target_flat = target.flatten()
+    point_pred_flat = point_pred.flatten()
+
+    coverage_95 = ((target_flat >= q_0025_flat) & (target_flat <= q_0975_flat)).float().mean().item()
+    coverage_50 = ((target_flat >= q_025_flat) & (target_flat <= q_075_flat)).float().mean().item()
+
+    point_pred_safe = torch.clamp(point_pred_flat.abs(), min=1e-3)
+    width_95 = q_0975_flat - q_0025_flat
+    width_50 = q_075_flat - q_025_flat
+
+    mwp_95 = (width_95 / point_pred_safe).mean().item()
+    mwp_50 = (width_50 / point_pred_safe).mean().item()
+
+    mc_95 = mwp_95 / max(coverage_95, 1e-6)
+    mc_50 = mwp_50 / max(coverage_50, 1e-6)
+
+    return {
+        'CP_95': coverage_95,
+        'CP_50': coverage_50,
+        'MWP_95': mwp_95,
+        'MWP_50': mwp_50,
+        'MC_95': mc_95,
+        'MC_50': mc_50
+    }
+
+
+# ==================== 多任务损失 ====================
+class MultiTaskLoss(nn.Module):
+    def __init__(self, alpha=1.4, beta=0.28, gamma=0.30):
+        super(MultiTaskLoss, self).__init__()
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.point_criterion = nn.SmoothL1Loss()
+        print(f"[INFO] MultiTaskLoss: α={alpha}, β={beta}, γ={gamma}")
+
+    def forward(self, point_pred, mu, sigma, interval_pred, target):
+        loss_point = self.point_criterion(point_pred, target)
+
+        if torch.isnan(loss_point) or torch.isinf(loss_point):
+            loss_point = torch.tensor(0.0, device=target.device, dtype=target.dtype)
+
+        loss_crps = compute_crps(mu, sigma, target)
+
+        if torch.isnan(loss_crps) or torch.isinf(loss_crps) or loss_crps > 1.0:
+            loss_crps = torch.clamp(loss_crps, min=0.0, max=0.1)
+
+        quantiles = torch.tensor([0.025, 0.25, 0.75, 0.975], device=target.device, dtype=target.dtype)
+        loss_interval = 0.0
+        for i, q in enumerate(quantiles):
+            pred_q = interval_pred[:, i, :, :]
+            error = target - pred_q
+            loss_q = torch.maximum(q * error, (q - 1) * error)
+            loss_interval += loss_q.mean()
+        loss_interval = loss_interval / len(quantiles)
+
+        if torch.isnan(loss_interval) or torch.isinf(loss_interval):
+            loss_interval = torch.tensor(0.0, device=target.device, dtype=target.dtype)
+
+        total_loss = (self.alpha * loss_point + self.beta * loss_crps + self.gamma * loss_interval)
+
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            total_loss = loss_point
+
+        return total_loss, {
+            'point_loss': loss_point.item(),
+            'crps_loss': loss_crps.item(),
+            'interval_loss': loss_interval.item(),
+            'total_loss': total_loss.item()
+        }
+
+
+# ==================== Warmup学习率调度器 ====================
+class WarmupCosineScheduler:
+    def __init__(self, optimizer, warmup_epochs, total_epochs, min_lr=1e-6):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.min_lr = min_lr
+        self.base_lrs = [group['lr'] for group in optimizer.param_groups]
+
+    def step(self, epoch):
+        if epoch < self.warmup_epochs:
+            lr_scale = (epoch + 1) / self.warmup_epochs
+        else:
+            progress = (epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            lr_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        for param_group, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+            param_group['lr'] = max(self.min_lr, base_lr * lr_scale)
+
+        return self.optimizer.param_groups[0]['lr']
+
+
+# ==================== 可视化函数 ====================
+def visualize_predictions(model, dataloader, device, save_dir='visualizations_TCN_task2', num_samples=5):
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(dataloader):
+            if batch_idx >= num_samples:
+                break
+
+            tigge_spatial = batch['tigge_spatial'].to(device)
+            dem_spatial = batch['dem_spatial'].to(device)
+            interaction_spatial = batch['interaction_spatial'].to(device)
+            tigge_seq = batch['tigge_seq'].to(device)
+            time_features_t = batch['time_features_t'].to(device)
+            time_features_seq = batch['time_features_seq'].to(device)
+            target = batch['target'].to(device)
+
+            point_pred, mu, sigma, interval_pred = model(
+                tigge_spatial, dem_spatial, interaction_spatial,
+                tigge_seq, time_features_t, time_features_seq
+            )
+
+            h_center, w_center = 24, 48
+            target_val = target[0, h_center, w_center].cpu().numpy()
+            point_val = point_pred[0, h_center, w_center].cpu().numpy()
+            mu_val = mu[0, h_center, w_center].cpu().numpy()
+            sigma_val = sigma[0, h_center, w_center].cpu().numpy()
+            q_vals = interval_pred[0, :, h_center, w_center].cpu().numpy()
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+            x_range = np.linspace(max(0, mu_val - 4 * sigma_val), min(1, mu_val + 4 * sigma_val), 200)
+            pdf = stats.norm.pdf(x_range, mu_val, sigma_val)
+
+            axes[0].plot(x_range, pdf, 'b-', linewidth=2, label='Predicted PDF')
+            axes[0].axvline(target_val, color='r', linestyle='--', linewidth=2, label=f'True: {target_val:.3f}')
+            axes[0].axvline(mu_val, color='g', linestyle='--', linewidth=2, label=f'Mean: {mu_val:.3f}')
+            axes[0].fill_between(x_range, 0, pdf, alpha=0.3)
+            axes[0].set_xlabel('Wind Speed (normalized)', fontsize=12)
+            axes[0].set_ylabel('Probability Density', fontsize=12)
+            axes[0].set_title(f'TCN Probabilistic Prediction (Sample {batch_idx + 1})', fontsize=14)
+            axes[0].legend()
+            axes[0].grid(True, alpha=0.3)
+
+            axes[1].errorbar([0], [point_val],
+                             yerr=[[point_val - q_vals[0]], [q_vals[3] - point_val]],
+                             fmt='o', markersize=8, capsize=10, capthick=2,
+                             label='95% CI', color='blue', linewidth=2)
+            axes[1].errorbar([0], [point_val],
+                             yerr=[[point_val - q_vals[1]], [q_vals[2] - point_val]],
+                             fmt='o', markersize=6, capsize=8, capthick=2,
+                             label='50% CI', color='green', linewidth=2)
+            axes[1].scatter([0], [target_val], color='red', s=100, marker='*',
+                            label=f'True: {target_val:.3f}', zorder=5)
+
+            axes[1].set_xlim(-0.5, 0.5)
+            axes[1].set_ylim(max(0, q_vals[0] - 0.1), min(1, q_vals[3] + 0.1))
+            axes[1].set_xticks([])
+            axes[1].set_ylabel('Wind Speed (normalized)', fontsize=12)
+            axes[1].set_title(f'TCN Interval Prediction (Sample {batch_idx + 1})', fontsize=14)
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig(f'{save_dir}/prediction_sample_{batch_idx + 1}.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Visualizations saved to {save_dir}/")
+
+
+# ==================== 训练函数 ====================
+def train_model(model, train_loader, val_loader, device,
+                epochs=10, learning_rate=0.0008, weight_decay=0.0001,
+                patience=4, accumulation_steps=2, warmup_epochs=1):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Started training process (TCN - Multi-Task)")
+
+    criterion = MultiTaskLoss(alpha=1.4, beta=0.28, gamma=0.30)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=learning_rate,
+        weight_decay=weight_decay,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs, epochs, min_lr=1e-6)
+    scaler = GradScaler()
+    best_val_loss = float('inf')
+
+    train_losses, val_losses = [], []
+    train_mae, train_rmse, train_r2 = [], [], []
+    val_mae, val_rmse, val_r2 = [], [], []
+    train_crps, val_crps = [], []
+    train_cp_95, train_cp_50, val_cp_95, val_cp_50 = [], [], [], []
+    train_mwp_95, train_mwp_50, val_mwp_95, val_mwp_50 = [], [], [], []
+    train_mc_95, train_mc_50, val_mc_95, val_mc_50 = [], [], [], []
+
+    patience_counter = 0
+    os.makedirs('checkpoints_TCN_task2', exist_ok=True)
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Checkpoint directory created: checkpoints_TCN_task2")
+
+    start_time = time.time()
+    for epoch in range(epochs):
+        epoch_start = time.time()
+
+        current_lr = scheduler.step(epoch)
+        print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Epoch {epoch + 1}/{epochs}, LR: {current_lr:.6f}")
+
+        model.train()
+        train_loss = 0.0
+        batch_count = 0
+
+        train_point_preds, train_mus, train_sigmas, train_interval_preds, train_targets = [], [], [], [], []
+        optimizer.zero_grad()
+
+        for batch_idx, batch in enumerate(train_loader):
+            batch_start = time.time()
+            try:
+                tigge_spatial = batch['tigge_spatial'].to(device, non_blocking=True)
+                dem_spatial = batch['dem_spatial'].to(device, non_blocking=True)
+                interaction_spatial = batch['interaction_spatial'].to(device, non_blocking=True)
+                tigge_seq = batch['tigge_seq'].to(device, non_blocking=True)
+                time_features_t = batch['time_features_t'].to(device, non_blocking=True)
+                time_features_seq = batch['time_features_seq'].to(device, non_blocking=True)
+                target = batch['target'].to(device, non_blocking=True)
+
+                with autocast():
+                    point_pred, mu, sigma, interval_pred = model(
+                        tigge_spatial, dem_spatial, interaction_spatial,
+                        tigge_seq, time_features_t, time_features_seq
+                    )
+                    loss, loss_dict = criterion(point_pred, mu, sigma, interval_pred, target)
+
+                train_point_preds.append(point_pred.detach().cpu().float())
+                train_mus.append(mu.detach().cpu().float())
+                train_sigmas.append(sigma.detach().cpu().float())
+                train_interval_preds.append(interval_pred.detach().cpu().float())
+                train_targets.append(target.detach().cpu().float())
+
+                scaler.scale(loss / accumulation_steps).backward()
+
+                if (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+
+                train_loss += loss.item() * tigge_spatial.size(0)
+                batch_count += 1
+
+                # 每50个batch输出一次，包含当前时间
+                if batch_idx % 50 == 0 or batch_idx == len(train_loader) - 1:
+                    batch_time = time.time() - batch_start
+                    progress = (batch_idx + 1) / len(train_loader) * 100
+                    print(
+                        f"  [{time.strftime('%Y-%m-%d %H:%M:%S')}] Batch {batch_idx + 1}/{len(train_loader)} ({progress:.1f}%), "
+                        f"Loss: {loss.item():.4f} [P:{loss_dict['point_loss']:.4f}, "
+                        f"C:{loss_dict['crps_loss']:.4f}, I:{loss_dict['interval_loss']:.4f}], "
+                        f"Time: {batch_time:.2f}s")
+
+                # 定期清理GPU内存
+                if batch_idx % 30 == 0:
+                    torch.cuda.empty_cache()
+
+            except Exception as e:
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error processing batch {batch_idx}: {str(e)}")
+                optimizer.zero_grad()
+                torch.cuda.empty_cache()
+                continue
+
+        train_loss = train_loss / len(train_loader.dataset) if batch_count > 0 else float('inf')
+        train_losses.append(train_loss)
+
+        # 计算训练指标
+        if len(train_point_preds) > 0:
+            train_point_preds_tensor = torch.cat(train_point_preds)
+            train_mus_tensor = torch.cat(train_mus)
+            train_sigmas_tensor = torch.cat(train_sigmas)
+            train_interval_preds_tensor = torch.cat(train_interval_preds)
+            train_targets_tensor = torch.cat(train_targets)
+
+            train_point_preds_flat = train_point_preds_tensor.numpy().flatten()
+            train_mus_flat = train_mus_tensor.numpy().flatten()
+            train_sigmas_flat = train_sigmas_tensor.numpy().flatten()
+            train_targets_flat = train_targets_tensor.numpy().flatten()
+
+            train_mae_val = np.mean(np.abs(train_point_preds_flat - train_targets_flat))
+            train_rmse_val = np.sqrt(np.mean((train_point_preds_flat - train_targets_flat) ** 2))
+            train_mean = np.mean(train_targets_flat)
+            ss_tot = np.sum((train_targets_flat - train_mean) ** 2)
+            ss_res = np.sum((train_targets_flat - train_point_preds_flat) ** 2)
+            train_r2_val = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+            train_crps_val = compute_crps(
+                torch.from_numpy(train_mus_flat),
+                torch.from_numpy(train_sigmas_flat),
+                torch.from_numpy(train_targets_flat)
+            ).item()
+
+            train_interval_metrics = compute_interval_metrics(
+                train_interval_preds_tensor,
+                train_targets_tensor,
+                train_point_preds_tensor
+            )
+        else:
+            train_mae_val = train_rmse_val = train_r2_val = train_crps_val = 0
+            train_interval_metrics = {'CP_95': 0, 'CP_50': 0, 'MWP_95': 0, 'MWP_50': 0, 'MC_95': 0, 'MC_50': 0}
+
+        train_mae.append(train_mae_val)
+        train_rmse.append(train_rmse_val)
+        train_r2.append(train_r2_val)
+        train_crps.append(train_crps_val)
+        train_cp_95.append(train_interval_metrics['CP_95'])
+        train_cp_50.append(train_interval_metrics['CP_50'])
+        train_mwp_95.append(train_interval_metrics['MWP_95'])
+        train_mwp_50.append(train_interval_metrics['MWP_50'])
+        train_mc_95.append(train_interval_metrics['MC_95'])
+        train_mc_50.append(train_interval_metrics['MC_50'])
+
+        print(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] Epoch {epoch + 1}/{epochs} Training Metrics:')
+        print(
+            f'  Loss: {train_loss:.6f} | MAE: {train_mae_val:.4f} | RMSE: {train_rmse_val:.4f} | R²: {train_r2_val:.4f}')
+        print(f'  CRPS: {train_crps_val:.4f}')
+        print(f'  CP_95: {train_interval_metrics["CP_95"]:.4f} | CP_50: {train_interval_metrics["CP_50"]:.4f}')
+        print(f'  MWP_95: {train_interval_metrics["MWP_95"]:.4f} | MWP_50: {train_interval_metrics["MWP_50"]:.4f}')
+        print(f'  MC_95: {train_interval_metrics["MC_95"]:.4f} | MC_50: {train_interval_metrics["MC_50"]:.4f}')
+
+        # 清理
+        del train_point_preds, train_mus, train_sigmas, train_interval_preds, train_targets
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        val_batch_count = 0
+
+        val_point_preds, val_mus, val_sigmas, val_interval_preds, val_targets = [], [], [], [], []
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_loader):
+                try:
+                    tigge_spatial = batch['tigge_spatial'].to(device, non_blocking=True)
+                    dem_spatial = batch['dem_spatial'].to(device, non_blocking=True)
+                    interaction_spatial = batch['interaction_spatial'].to(device, non_blocking=True)
+                    tigge_seq = batch['tigge_seq'].to(device, non_blocking=True)
+                    time_features_t = batch['time_features_t'].to(device, non_blocking=True)
+                    time_features_seq = batch['time_features_seq'].to(device, non_blocking=True)
+                    target = batch['target'].to(device, non_blocking=True)
+
+                    with autocast():
+                        point_pred, mu, sigma, interval_pred = model(
+                            tigge_spatial, dem_spatial, interaction_spatial,
+                            tigge_seq, time_features_t, time_features_seq
+                        )
+                        loss, _ = criterion(point_pred, mu, sigma, interval_pred, target)
+
+                    val_point_preds.append(point_pred.cpu().float())
+                    val_mus.append(mu.cpu().float())
+                    val_sigmas.append(sigma.cpu().float())
+                    val_interval_preds.append(interval_pred.cpu().float())
+                    val_targets.append(target.cpu().float())
+
+                    val_loss += loss.item() * tigge_spatial.size(0)
+                    val_batch_count += 1
+
+                except Exception as e:
+                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error in val batch {batch_idx}: {str(e)}")
+                    continue
+
+        val_loss = val_loss / len(val_loader.dataset) if val_batch_count > 0 else float('inf')
+        val_losses.append(val_loss)
+
+        # 计算验证指标
+        if len(val_point_preds) > 0:
+            val_point_preds_tensor = torch.cat(val_point_preds)
+            val_mus_tensor = torch.cat(val_mus)
+            val_sigmas_tensor = torch.cat(val_sigmas)
+            val_interval_preds_tensor = torch.cat(val_interval_preds)
+            val_targets_tensor = torch.cat(val_targets)
+
+            val_point_preds_flat = val_point_preds_tensor.numpy().flatten()
+            val_mus_flat = val_mus_tensor.numpy().flatten()
+            val_sigmas_flat = val_sigmas_tensor.numpy().flatten()
+            val_targets_flat = val_targets_tensor.numpy().flatten()
+
+            val_mae_val = np.mean(np.abs(val_point_preds_flat - val_targets_flat))
+            val_rmse_val = np.sqrt(np.mean((val_point_preds_flat - val_targets_flat) ** 2))
+            val_mean = np.mean(val_targets_flat)
+            ss_tot = np.sum((val_targets_flat - val_mean) ** 2)
+            ss_res = np.sum((val_targets_flat - val_point_preds_flat) ** 2)
+            val_r2_val = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0
+
+            val_crps_val = compute_crps(
+                torch.from_numpy(val_mus_flat),
+                torch.from_numpy(val_sigmas_flat),
+                torch.from_numpy(val_targets_flat)
+            ).item()
+
+            val_interval_metrics = compute_interval_metrics(
+                val_interval_preds_tensor,
+                val_targets_tensor,
+                val_point_preds_tensor
+            )
+        else:
+            val_mae_val = val_rmse_val = val_r2_val = val_crps_val = 0
+            val_interval_metrics = {'CP_95': 0, 'CP_50': 0, 'MWP_95': 0, 'MWP_50': 0, 'MC_95': 0, 'MC_50': 0}
+
+        val_mae.append(val_mae_val)
+        val_rmse.append(val_rmse_val)
+        val_r2.append(val_r2_val)
+        val_crps.append(val_crps_val)
+        val_cp_95.append(val_interval_metrics['CP_95'])
+        val_cp_50.append(val_interval_metrics['CP_50'])
+        val_mwp_95.append(val_interval_metrics['MWP_95'])
+        val_mwp_50.append(val_interval_metrics['MWP_50'])
+        val_mc_95.append(val_interval_metrics['MC_95'])
+        val_mc_50.append(val_interval_metrics['MC_50'])
+
+        print(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] Epoch {epoch + 1}/{epochs} Validation Metrics:')
+        print(f'  Loss: {val_loss:.6f} | MAE: {val_mae_val:.4f} | RMSE: {val_rmse_val:.4f} | R²: {val_r2_val:.4f}')
+        print(f'  CRPS: {val_crps_val:.4f}')
+        print(f'  CP_95: {val_interval_metrics["CP_95"]:.4f} | CP_50: {val_interval_metrics["CP_50"]:.4f}')
+        print(f'  MWP_95: {val_interval_metrics["MWP_95"]:.4f} | MWP_50: {val_interval_metrics["MWP_50"]:.4f}')
+        print(f'  MC_95: {val_interval_metrics["MC_95"]:.4f} | MC_50: {val_interval_metrics["MC_50"]:.4f}')
+
+        # 清理
+        del val_point_preds, val_mus, val_sigmas, val_interval_preds, val_targets
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # 保存最佳模型
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), 'checkpoints_TCN_task2/best_model_TCN_task2.pth')
+            print(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] *** Best model saved with val loss: {best_val_loss:.6f} ***')
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f'[{time.strftime("%Y-%m-%d %H:%M:%S")}] Early stopping at epoch {epoch + 1}')
+                break
+
+        # 保存检查点
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'train_losses': train_losses, 'val_losses': val_losses,
+            'train_mae': train_mae, 'val_mae': val_mae,
+            'train_rmse': train_rmse, 'val_rmse': val_rmse,
+            'train_r2': train_r2, 'val_r2': val_r2,
+            'train_crps': train_crps, 'val_crps': val_crps,
+            'train_cp_95': train_cp_95, 'val_cp_95': val_cp_95,
+            'train_cp_50': train_cp_50, 'val_cp_50': val_cp_50,
+            'train_mwp_95': train_mwp_95, 'val_mwp_95': val_mwp_95,
+            'train_mwp_50': train_mwp_50, 'val_mwp_50': val_mwp_50,
+            'train_mc_95': train_mc_95, 'val_mc_95': val_mc_95,
+            'train_mc_50': train_mc_50, 'val_mc_50': val_mc_50
+        }, f'checkpoints_TCN_task2/checkpoint_epoch_{epoch + 1}_TCN_task2.pth')
+
+        epoch_end = time.time()
+        epoch_time = epoch_end - epoch_start
+        remaining_epochs = epochs - (epoch + 1)
+        est_remaining_time = remaining_epochs * epoch_time
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Epoch {epoch + 1} completed in {epoch_time / 60:.2f} min")
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Estimated remaining: {est_remaining_time / 60:.2f} min\n")
+
+    end_time = time.time()
+    total_time = end_time - start_time
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Training completed in {total_time / 3600:.2f} hours")
+
+    # 生成可视化
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Generating visualization plots")
+
+    # 损失曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss', color='blue', linewidth=2)
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss', color='orange', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('Loss', fontsize=12)
+    plt.title('TCN - Training and Validation Loss', fontsize=14)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    # MAE曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_mae) + 1), train_mae, label='Train MAE', color='blue', linewidth=2)
+    plt.plot(range(1, len(val_mae) + 1), val_mae, label='Validation MAE', color='orange', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('MAE', fontsize=12)
+    plt.title('TCN - Mean Absolute Error', fontsize=14)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('mae_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    # RMSE曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_rmse) + 1), train_rmse, label='Train RMSE', color='blue', linewidth=2)
+    plt.plot(range(1, len(val_rmse) + 1), val_rmse, label='Validation RMSE', color='orange', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('RMSE', fontsize=12)
+    plt.title('TCN - Root Mean Squared Error', fontsize=14)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('rmse_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    # R²曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_r2) + 1), train_r2, label='Train R²', color='blue', linewidth=2)
+    plt.plot(range(1, len(val_r2) + 1), val_r2, label='Validation R²', color='orange', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('R²', fontsize=12)
+    plt.title('TCN - R² Score', fontsize=14)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('r2_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    # CRPS曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_crps) + 1), train_crps, label='Train CRPS', color='blue', linewidth=2)
+    plt.plot(range(1, len(val_crps) + 1), val_crps, label='Validation CRPS', color='orange', linewidth=2)
+    plt.xlabel('Epoch', fontsize=12)
+    plt.ylabel('CRPS', fontsize=12)
+    plt.title('TCN - Continuous Ranked Probability Score', fontsize=14)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('crps_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    # 覆盖率曲线
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    axes[0].plot(range(1, len(train_cp_95) + 1), train_cp_95, label='Train CP 95%', color='blue', linewidth=2)
+    axes[0].plot(range(1, len(val_cp_95) + 1), val_cp_95, label='Val CP 95%', color='orange', linewidth=2)
+    axes[0].axhline(y=0.95, color='red', linestyle='--', linewidth=2, label='Target (95%)')
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Coverage Probability', fontsize=12)
+    axes[0].set_title('TCN - 95% CI Coverage', fontsize=14)
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(range(1, len(train_cp_50) + 1), train_cp_50, label='Train CP 50%', color='blue', linewidth=2)
+    axes[1].plot(range(1, len(val_cp_50) + 1), val_cp_50, label='Val CP 50%', color='orange', linewidth=2)
+    axes[1].axhline(y=0.50, color='red', linestyle='--', linewidth=2, label='Target (50%)')
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Coverage Probability', fontsize=12)
+    axes[1].set_title('TCN - 50% CI Coverage', fontsize=14)
+    axes[1].legend()
+    axes[1].grid(True)
+    plt.tight_layout()
+    plt.savefig('coverage_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    # MWP曲线
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    axes[0].plot(range(1, len(train_mwp_95) + 1), train_mwp_95, label='Train MWP 95%', color='blue', linewidth=2)
+    axes[0].plot(range(1, len(val_mwp_95) + 1), val_mwp_95, label='Val MWP 95%', color='orange', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Mean Width Percentage', fontsize=12)
+    axes[0].set_title('TCN - 95% Interval Width', fontsize=14)
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(range(1, len(train_mwp_50) + 1), train_mwp_50, label='Train MWP 50%', color='blue', linewidth=2)
+    axes[1].plot(range(1, len(val_mwp_50) + 1), val_mwp_50, label='Val MWP 50%', color='orange', linewidth=2)
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Mean Width Percentage', fontsize=12)
+    axes[1].set_title('TCN - 50% Interval Width', fontsize=14)
+    axes[1].legend()
+    axes[1].grid(True)
+    plt.tight_layout()
+    plt.savefig('width_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    # MC曲线
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+    axes[0].plot(range(1, len(train_mc_95) + 1), train_mc_95, label='Train MC 95%', color='blue', linewidth=2)
+    axes[0].plot(range(1, len(val_mc_95) + 1), val_mc_95, label='Val MC 95%', color='orange', linewidth=2)
+    axes[0].set_xlabel('Epoch', fontsize=12)
+    axes[0].set_ylabel('Mean Coverage', fontsize=12)
+    axes[0].set_title('TCN - 95% Interval Efficiency', fontsize=14)
+    axes[0].legend()
+    axes[0].grid(True)
+
+    axes[1].plot(range(1, len(train_mc_50) + 1), train_mc_50, label='Train MC 50%', color='blue', linewidth=2)
+    axes[1].plot(range(1, len(val_mc_50) + 1), val_mc_50, label='Val MC 50%', color='orange', linewidth=2)
+    axes[1].set_xlabel('Epoch', fontsize=12)
+    axes[1].set_ylabel('Mean Coverage', fontsize=12)
+    axes[1].set_title('TCN - 50% Interval Efficiency', fontsize=14)
+    axes[1].legend()
+    axes[1].grid(True)
+    plt.tight_layout()
+    plt.savefig('mc_curve_TCN_task2.png', dpi=300)
+    plt.close()
+
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] All metric curves saved")
+
+    # 预测可视化
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Generating prediction visualizations")
+    visualize_predictions(model, val_loader, device, save_dir='visualizations_TCN_task2', num_samples=5)
+
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Training pipeline completed!")
+
+
+# ==================== 主程序 ====================
+if __name__ == "__main__":
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Program started (TCN - Multi-Task)")
+    print("=" * 80)
+
+    set_seed(42)
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    H, W = 48, 96
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Using device: {device}")
+
+    if torch.cuda.is_available():
+        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] GPU: {torch.cuda.get_device_name(0)}")
+        print(
+            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+
+    # ========== 优化后的超参数（降低训练时间）==========
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Setting up training parameters")
+    batch_size = 4  # 减小batch_size避免OOM
+    epochs = 10  # 减少epochs
+    learning_rate = 0.0008  # 增大学习率加速收敛
+    weight_decay = 0.0001
+    patience = 4
+    accumulation_steps = 2  # 减少累积步数
+    warmup_epochs = 1  # 减少warmup
+
+    # TCN参数（减小通道数降低计算量）
+    tcn_channels = [32, 64, 96]  # 减小通道数
+    kernel_size = 3
+    output_dim = 128  # 减小输出维度
+    dropout_rate = 0.1
+
+    print(f"  batch_size: {batch_size}")
+    print(f"  epochs: {epochs}")
+    print(f"  learning_rate: {learning_rate}")
+    print(f"  weight_decay: {weight_decay}")
+    print(f"  patience: {patience}")
+    print(f"  accumulation_steps: {accumulation_steps}")
+    print(f"  warmup_epochs: {warmup_epochs}")
+    print(f"  TCN channels: {tcn_channels}")
+    print(f"  kernel_size: {kernel_size}")
+    print(f"  output_dim: {output_dim}")
+    print(f"  dropout_rate: {dropout_rate}")
+
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loading training dataset")
+    train_ds = WindDataset(r"E:\yym2\qixiang\Obs_PDF\final\train.nc", H, W)
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Loading validation dataset")
+    val_ds = WindDataset(r"E:\yym2\qixiang\Obs_PDF\final\val.nc", H, W)
+
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Creating data loaders")
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=0, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=0, pin_memory=True)
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Data loaders created successfully")
+    print(f"  Train batches: {len(train_loader)}")
+    print(f"  Validation batches: {len(val_loader)}")
+
+    # 初始化TCN模型
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Initializing TCN model")
+    model = TCNWindSpeedPredictor(
+        H, W,
+        tigge_features=10,
+        dropout_rate=dropout_rate,
+        tcn_channels=tcn_channels,
+        kernel_size=kernel_size,
+        output_dim=output_dim
+    ).to(device)
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Model initialized successfully")
+
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] Starting Training")
+    print("=" * 80)
+    train_model(
+        model, train_loader, val_loader, device,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        patience=patience,
+        accumulation_steps=accumulation_steps,
+        warmup_epochs=warmup_epochs
+    )
+    print(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] All tasks completed!")
+    print("=" * 80)
