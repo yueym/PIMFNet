@@ -19,5 +19,6 @@ This repository is the official PyTorch implementation of the paper "PIMFNet: A 
 2. Next, use the `optimization.py` file in the `Model code` folder to optimize the hyperparameters of the proposed model, including learning rate, batch size, and number of hidden layers.
 3. Finally, use the `test.py` file in the `Model code` folder to test the wind speed prediction results.
 
-
+### Baselines
+The `Baselines` folder contains the training and testing codes for some baselines used in this study. 
 
